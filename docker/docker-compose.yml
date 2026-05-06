@@ -1,0 +1,139 @@
+services:
+  # ─── API ──────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: development      # ← uses the dev stage: no pre-build needed
+    command: npm run start:dev # NestJS watch mode compiles + restarts on change
+    ports:
+      - "3004:3000"
+    env_file: ../.env
+    environment:
+      NODE_ENV: development
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: transact_go
+      DB_PASSWORD: transact_go_secret
+      DB_NAME: transact_go_db
+      DB_SYNC: "true"          # auto-sync schema in dev — use migrations in prod
+      DB_LOGGING: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: redis_secret
+      JWT_SECRET: dev-jwt-secret-change-in-production-min-32-chars
+      JWT_REFRESH_SECRET: dev-refresh-secret-change-in-production-min-32-chars
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../src:/app/src               # hot reload — maps your local src into container
+      - ../nest-cli.json:/app/nest-cli.json
+    networks: [transact_go]
+    restart: unless-stopped
+
+  # ─── PostgreSQL ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: transact_go_db
+      POSTGRES_USER: transact_go
+      POSTGRES_PASSWORD: transact_go_secret
+    ports:
+      - "5435:5432"            # 5435 externally so it doesn't clash with a local PG
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transact_go -d transact_go_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [transact_go]
+
+  # ─── Redis ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass redis_secret
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_secret", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [transact_go]
+
+  # ─── Bull Board (Queue UI) ────────────────────────────────────────────────
+  bull-board:
+    image: deadly0/bull-board:latest
+    ports:
+      - "3001:3000"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: redis_secret
+    depends_on: [redis]
+    networks: [transact_go]
+
+  # ─── PgAdmin (DB UI) ─────────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@transact_go.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on: [postgres]
+    networks: [transact_go]
+    profiles: [tools]
+
+  # ─── Prometheus ───────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheusdata:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=15d'
+    networks: [transact_go]
+    profiles: [monitoring]
+
+  # ─── Grafana ──────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3002:3000"
+    depends_on: [prometheus]
+    networks: [transact_go]
+    profiles: [monitoring]
+
+networks:
+  transact_go:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  prometheusdata:
+  grafanadata:

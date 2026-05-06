@@ -1,0 +1,235 @@
+name: TransactGo API — CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ─── Lint & Type Check ─────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm' }
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+
+  # ─── Unit Tests ────────────────────────────────────────────────────────────
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm' }
+      - run: npm ci
+      - run: npm run test:cov
+      - uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # ─── Integration Tests ─────────────────────────────────────────────────────
+  test-e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: transact_go_test
+          POSTGRES_USER: transact_go
+          POSTGRES_PASSWORD: test_secret
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+        ports: ['5432:5432']
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+        ports: ['6379:6379']
+
+    env:
+      NODE_ENV: test
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USERNAME: transact_go
+      DB_PASSWORD: test_secret
+      DB_NAME: transact_go_test
+      DB_SYNC: 'true'
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      JWT_SECRET: test-jwt-secret-at-least-32-characters-long
+      JWT_REFRESH_SECRET: test-refresh-secret-at-least-32-characters-long
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm' }
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:e2e
+
+  # ─── Security Audit ────────────────────────────────────────────────────────
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'npm' }
+      - run: npm audit --audit-level=high
+
+  # ─── Build Docker Image ────────────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    needs: [lint, test-unit, test-e2e, security]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - uses: docker/build-push-action@v5
+        id: build
+        with:
+          context: .
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  # ─── Deploy to Staging ─────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      - name: Deploy to ECS Staging
+        run: |
+          aws ecs update-service \
+            --cluster transact-go-staging \
+            --service transact-go-api-staging \
+            --force-new-deployment \
+            --region eu-west-1
+
+      - name: Wait for deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster transact-go-staging \
+            --services transact-go-api-staging \
+            --region eu-west-1
+
+      - name: Smoke test staging
+        run: |
+          curl -f https://api-staging.yourapp.com/api/v1/health || exit 1
+
+  # ─── Deploy to Production ──────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production   # requires manual approval via GitHub Environments
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      - name: Run DB migrations
+        run: |
+          # Run migrations before swapping traffic
+          aws ecs run-task \
+            --cluster transact-go-production \
+            --task-definition transact-go-migration \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ secrets.SUBNET_ID }}],securityGroups=[${{ secrets.SG_ID }}],assignPublicIp=DISABLED}"
+
+      - name: Deploy to ECS Production (rolling)
+        run: |
+          aws ecs update-service \
+            --cluster transact-go-production \
+            --service transact-go-api-production \
+            --force-new-deployment \
+            --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100" \
+            --region eu-west-1
+
+      - name: Wait for stable deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster transact-go-production \
+            --services transact-go-api-production
+
+      - name: Smoke test production
+        run: |
+          curl -f https://api.yourapp.com/api/v1/health || exit 1
+
+      - name: Notify team on success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {"text": "✅ transact-go-api deployed to production: ${{ github.sha }}"}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
