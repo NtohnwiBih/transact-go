@@ -6,15 +6,11 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { InjectQueue } from '@nestjs/bull';
 import type { Queue } from 'bull';
-import { KycSubmission, KycStatus, DocumentType } from './entities/kyc-submission.entity';
+import { KycSubmission, KycStatus } from './entities/kyc-submission.entity';
 import { User, KycTier } from '../users/entities/user.entity';
+import { SubmitKycDto } from './dto/kyc.dto';
 
-export class SubmitKycDto {
-  targetTier: KycTier;
-  documentType: DocumentType;
-  documentNumber?: string;
-  documentReference?: string;
-}
+export { SubmitKycDto };
 
 @Injectable()
 export class KycService {
@@ -34,13 +30,8 @@ export class KycService {
       throw new ForbiddenException(`Already at KYC Tier ${user.kycTier}`);
     }
 
-    // Check for in-progress submission
     const existing = await this.kycRepo.findOne({
-      where: {
-        userId,
-        targetTier: dto.targetTier,
-        status: In([KycStatus.PENDING]),
-      },
+      where: { userId, targetTier: dto.targetTier, status: In([KycStatus.PENDING]) },
     });
     if (existing) throw new ConflictException('A KYC submission for this tier is already pending');
 
@@ -48,7 +39,6 @@ export class KycService {
       this.kycRepo.create({ userId, ...dto, status: KycStatus.PENDING }),
     );
 
-    // Queue verification — simulates async provider call (Smile Identity, etc.)
     await this.kycQueue.add(
       'verify-kyc',
       { submissionId: submission.id, userId, targetTier: dto.targetTier },
@@ -69,7 +59,6 @@ export class KycService {
         reviewedAt: new Date(),
         reviewedBy: 'automated_system',
       });
-
       await this.userRepo.update(submission.userId, { kycTier: submission.targetTier });
       this.logger.log(`KYC approved: user ${submission.userId} → tier ${submission.targetTier}`);
     } else {
@@ -83,9 +72,6 @@ export class KycService {
   }
 
   async getUserSubmissions(userId: string): Promise<KycSubmission[]> {
-    return this.kycRepo.find({
-      where: { userId },
-      order: { createdAt: 'DESC' },
-    });
+    return this.kycRepo.find({ where: { userId }, order: { createdAt: 'DESC' } });
   }
 }
